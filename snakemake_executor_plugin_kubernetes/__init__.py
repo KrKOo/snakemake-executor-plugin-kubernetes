@@ -175,6 +175,10 @@ class Executor(RemoteExecutor):
         container.command = shlex.split("/bin/sh")
         container.args = ["-c", exec_job]
         container.working_dir = "/workdir"
+        container.security_context = kubernetes.client.V1SecurityContext(
+            allow_privilege_escalation=False,
+            capabilities=kubernetes.client.V1Capabilities(drop=["ALL"])
+        )
         container.volume_mounts = [
             kubernetes.client.V1VolumeMount(name="workdir", mount_path="/workdir"),
         ]
@@ -271,6 +275,13 @@ class Executor(RemoteExecutor):
                     restart_policy="Never", 
                     service_account_name=self.k8s_service_account_name if self.k8s_service_account_name else None,
                     volumes=volumes,
+                    security_context=kubernetes.client.V1PodSecurityContext(
+                        run_as_user=1000,
+                        run_as_non_root=True,
+                        seccomp_profile=kubernetes.client.V1SeccompProfile(
+                            type="RuntimeDefault"
+                        )
+                    )
                 ),
             )
         )
