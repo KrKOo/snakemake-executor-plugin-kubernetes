@@ -164,7 +164,7 @@ class Executor(RemoteExecutor):
             get_uuid(f"{self.run_namespace}-{job.jobid}-{job.attempt}")
         )
 
-        body = kubernetes.client.V1Pod()
+        body = kubernetes.client.V1Job()
         body.metadata = kubernetes.client.V1ObjectMeta(labels={"app": "snakemake"})
 
         body.metadata.name = jobid
@@ -182,36 +182,6 @@ class Executor(RemoteExecutor):
             container.volume_mounts.append(
                 kubernetes.client.V1VolumeMount(name=pvc.name, mount_path=str(pvc.path))
             )
-
-        node_selector = {}
-        if "machine_type" in job.resources.keys():
-            # Kubernetes labels a node by its instance type using this node_label.
-            node_selector["node.kubernetes.io/instance-type"] = job.resources[
-                "machine_type"
-            ]
-
-        body.spec = kubernetes.client.V1PodSpec(
-            containers=[container], node_selector=node_selector
-        )
-        # Add service account name if provided
-        if self.k8s_service_account_name:
-            body.spec.service_account_name = self.k8s_service_account_name
-
-        # fail on first error
-        body.spec.restart_policy = "Never"
-
-        workdir_volume = kubernetes.client.V1Volume(name="workdir")
-        workdir_volume.empty_dir = kubernetes.client.V1EmptyDirVolumeSource()
-        body.spec.volumes = [workdir_volume]
-
-        for pvc in self.persistent_volumes:
-            volume = kubernetes.client.V1Volume(name=pvc.name)
-            volume.persistent_volume_claim = (
-                kubernetes.client.V1PersistentVolumeClaimVolumeSource(
-                    claim_name=pvc.name
-                )
-            )
-            body.spec.volumes.append(volume)
 
         # env vars
         container.env = []
@@ -269,18 +239,55 @@ class Executor(RemoteExecutor):
                 privileged=True
             )
 
-        pod = self._kubernetes_retry(
-            lambda: self.kubeapi.create_namespaced_pod(self.namespace, body)
+        node_selector = {}
+        if "machine_type" in job.resources.keys():
+            # Kubernetes labels a node by its instance type using this node_label.
+            node_selector["node.kubernetes.io/instance-type"] = job.resources[
+                "machine_type"
+            ]
+            
+        workdir_volume = kubernetes.client.V1Volume(name="workdir")
+        workdir_volume.empty_dir = kubernetes.client.V1EmptyDirVolumeSource()
+        
+        volumes = [workdir_volume]
+
+        for pvc in self.persistent_volumes:
+            volume = kubernetes.client.V1Volume(name=pvc.name)
+            volume.persistent_volume_claim = (
+                kubernetes.client.V1PersistentVolumeClaimVolumeSource(
+                    claim_name=pvc.name
+                )
+            )
+            volumes.append(volume)
+
+        body.spec = kubernetes.client.V1JobSpec(
+            template=kubernetes.client.V1PodTemplateSpec(
+                metadata=kubernetes.client.V1ObjectMeta(
+                    labels={"app": "snakemake", "job": jobid}
+                ),
+                spec=kubernetes.client.V1PodSpec(
+                    containers=[container], 
+                    node_selector=node_selector, 
+                    restart_policy="Never", 
+                    service_account_name=self.k8s_service_account_name if self.k8s_service_account_name else None,
+                    volumes=volumes,
+                ),
+            )
+        )
+        
+        k8s_job = self._kubernetes_retry(
+            lambda: self.batchapi.create_namespaced_job(self.namespace, body)
         )
 
         self.logger.info(
             "Get status with:\n"
-            "kubectl describe pod {jobid}\n"
-            "kubectl logs {jobid}".format(jobid=jobid)
+            "kubectl describe job {jobid} -n {namespace}\n"
+            "kubectl describe pod -l job={jobid} -n {namespace}\n"
+            "kubectl logs -l job={jobid} -n {namespace}".format(jobid=jobid, namespace=self.namespace)
         )
 
         self.report_job_submission(
-            SubmittedJobInfo(job=job, external_jobid=jobid, aux={"pod": pod})
+            SubmittedJobInfo(job=job, external_jobid=jobid, aux={"k8s_job": k8s_job})
         )
 
     async def check_active_jobs(
@@ -306,7 +313,7 @@ class Executor(RemoteExecutor):
             async with self.status_rate_limiter:
                 try:
                     res = self._kubernetes_retry(
-                        lambda: self.kubeapi.read_namespaced_pod_status(
+                        lambda: self.batchapi.read_namespaced_job_status(
                             j.external_jobid, self.namespace
                         )
                     )
@@ -323,29 +330,36 @@ class Executor(RemoteExecutor):
 
                 if res is None:
                     msg = (
-                        "Unknown pod {jobid}. Has the pod been deleted manually?"
+                        "Unknown job {jobid}. Has the job been deleted manually?"
                     ).format(jobid=j.external_jobid)
                     self.report_job_error(j, msg=msg)
-                elif res.status.phase == "Failed":
+                elif res.status.failed and res.status.failed > 0:
+                    # failed
                     msg = (
                         "For details, please issue:\n"
-                        "kubectl describe pod {jobid}\n"
-                        "kubectl logs {jobid}"
-                    ).format(jobid=j.external_jobid)
-                    # failed
+                        "kubectl describe job {jobid} -n {namespace}\n"
+                        "kubectl describe pod -l job={jobid} -n {namespace}\n"
+                        "kubectl logs -l job={jobid} -n {namespace}"
+                    ).format(jobid=j.external_jobid, namespace=self.namespace)
+                    
+                    pod = self._get_pod_by_jobid(j.external_jobid)
+                    if pod is None:
+                        self.report_job_error(j, msg=msg)
+                        continue
+                    
                     kube_log_content = self.kubeapi.read_namespaced_pod_log(
-                        name=j.external_jobid, namespace=self.namespace
+                        name=pod.metadata.name, namespace=self.namespace
                     )
                     kube_log = self.log_path / f"{j.external_jobid}.log"
                     with open(kube_log, "w") as f:
                         f.write(kube_log_content)
                     self.report_job_error(j, msg=msg, aux_logs=[str(kube_log)])
-                elif res.status.phase == "Succeeded":
+                elif res.status.succeeded and res.status.succeeded > 0:
                     # finished
                     self.report_job_success(j)
 
                     self._kubernetes_retry(
-                        lambda: self.safe_delete_pod(
+                        lambda: self.safe_delete_job(
                             j.external_jobid, ignore_not_found=True
                         )
                     )
@@ -359,7 +373,7 @@ class Executor(RemoteExecutor):
 
         for j in active_jobs:
             self._kubernetes_retry(
-                lambda: self.safe_delete_pod(j.external_jobid, ignore_not_found=True)
+                lambda: self.safe_delete_job(j.external_jobid, ignore_not_found=True)
             )
 
     def shutdown(self):
@@ -404,19 +418,21 @@ class Executor(RemoteExecutor):
             )
         )
 
-    # In rare cases, deleting a pod may raise 404 NotFound error.
-    def safe_delete_pod(self, jobid, ignore_not_found=True):
+    # In rare cases, deleting a job/pod may raise 404 NotFound error.
+    def safe_delete_job(self, jobid, ignore_not_found=True):
         import kubernetes.client
 
         body = kubernetes.client.V1DeleteOptions()
         try:
-            self.kubeapi.delete_namespaced_pod(jobid, self.namespace, body=body)
+            self.batchapi.delete_namespaced_job(jobid, self.namespace, body=body)
+            pod = self._get_pod_by_jobid(jobid)
+            self.kubeapi.delete_namespaced_pod(pod.metadata.name, self.namespace, body=body)
         except kubernetes.client.rest.ApiException as e:
             if e.status == 404 and ignore_not_found:
                 # Can't find the pod. Maybe it's already been
                 # destroyed. Proceed with a warning message.
                 self.logger.warning(
-                    "[WARNING] 404 not found when trying to delete the pod: {jobid}\n"
+                    "[WARNING] 404 not found when trying to delete the job: {jobid}\n"
                     "[WARNING] Ignore this error\n".format(jobid=jobid)
                 )
             else:
@@ -492,6 +508,15 @@ class Executor(RemoteExecutor):
                         "Error 111 connection timeout, please check"
                         " that the k8 cluster master is reachable!",
                     )
+    
+    def _get_pod_by_jobid(self, jobid):
+        pods = self.kubeapi.list_namespaced_pod(
+            namespace=self.namespace,
+            label_selector=f"job={jobid}"
+        )
+        if len(pods.items) == 0:
+            return None
+        return pods.items[0]
 
 
 UUID_NAMESPACE = uuid.uuid5(
