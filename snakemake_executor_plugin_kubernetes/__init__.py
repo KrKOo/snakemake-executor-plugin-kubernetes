@@ -109,7 +109,7 @@ common_settings = CommonSettings(
     # Define whether your executor plugin implies that there is no shared
     # filesystem (True) or not (False).
     # This is e.g. the case for cloud execution.
-    implies_no_shared_fs=True,
+    implies_no_shared_fs=False,
     job_deploy_sources=True,
     pass_default_storage_provider_args=True,
     pass_default_resources_args=True,
@@ -434,8 +434,8 @@ class Executor(RemoteExecutor):
         import kubernetes.client
 
         body = kubernetes.client.V1DeleteOptions()
+
         try:
-            self.batchapi.delete_namespaced_job(jobid, self.namespace, body=body)
             pod = self._get_pod_by_jobid(jobid)
             self.kubeapi.delete_namespaced_pod(pod.metadata.name, self.namespace, body=body)
         except kubernetes.client.rest.ApiException as e:
@@ -443,12 +443,23 @@ class Executor(RemoteExecutor):
                 # Can't find the pod. Maybe it's already been
                 # destroyed. Proceed with a warning message.
                 self.logger.warning(
-                    "[WARNING] 404 not found when trying to delete the job: {jobid}\n"
+                    "[WARNING] 404 not found when trying to delete the pod: {jobid}\n"
                     "[WARNING] Ignore this error\n".format(jobid=jobid)
                 )
             else:
                 raise e
 
+        try:
+            self.batchapi.delete_namespaced_job(jobid, self.namespace, body=body)
+        except kubernetes.client.rest.ApiException as e:
+            if e.status == 404 and ignore_not_found:
+                self.logger.warning(
+                    "[WARNING] 404 not found when trying to delete the job: {jobid}\n"
+                    "[WARNING] Ignore this error\n".format(jobid=jobid)
+                )
+            else:
+                raise e
+        
     # Sometimes, certain k8s requests throw kubernetes.client.rest.ApiException
     # Solving this issue requires reauthentication, as _kubernetes_retry shows
     # However, reauthentication itself, under rare conditions, may also throw
