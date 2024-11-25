@@ -323,11 +323,13 @@ class Executor(RemoteExecutor):
         for j in active_jobs:
             async with self.status_rate_limiter:
                 try:
-                    res = self._kubernetes_retry(
-                        lambda: self.batchapi.read_namespaced_job_status(
-                            j.external_jobid, self.namespace
-                        )
-                    )
+                    # res = self._kubernetes_retry(
+                    #     lambda: self.batchapi.read_namespaced_job_status(
+                    #         j.external_jobid, self.namespace
+                    #     )
+                    # )
+                    
+                    res = self.batchapi.read_namespaced_job(j.external_jobid, self.namespace)
                 except kubernetes.client.rest.ApiException as e:
                     if e.status == 404:
                         # Jobid not found
