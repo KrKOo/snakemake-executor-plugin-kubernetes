@@ -366,6 +366,12 @@ class Executor(RemoteExecutor):
                     with open(kube_log, "w") as f:
                         f.write(kube_log_content)
                     self.report_job_error(j, msg=msg, aux_logs=[str(kube_log)])
+
+                    self._kubernetes_retry(
+                        lambda: self.safe_delete_job(
+                            j.external_jobid, ignore_not_found=True
+                        )
+                    )
                 elif res.status.succeeded and res.status.succeeded > 0:
                     # finished
                     self.report_job_success(j)
