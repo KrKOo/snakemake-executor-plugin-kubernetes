@@ -265,6 +265,7 @@ class Executor(RemoteExecutor):
             volumes.append(volume)
 
         body.spec = kubernetes.client.V1JobSpec(
+            backoff_limit=0,
             template=kubernetes.client.V1PodTemplateSpec(
                 metadata=kubernetes.client.V1ObjectMeta(
                     labels={"app": "snakemake", "job": jobid}
