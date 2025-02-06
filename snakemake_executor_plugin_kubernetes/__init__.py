@@ -266,6 +266,7 @@ class Executor(RemoteExecutor):
 
         body.spec = kubernetes.client.V1JobSpec(
             backoff_limit=0,
+            ttl_seconds_after_finished=180,
             template=kubernetes.client.V1PodTemplateSpec(
                 metadata=kubernetes.client.V1ObjectMeta(
                     labels={"app": "snakemake", "job": jobid}
