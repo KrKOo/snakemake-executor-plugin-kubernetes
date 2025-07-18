@@ -445,6 +445,12 @@ class Executor(RemoteExecutor):
 
         try:
             pod = self._get_pod_by_jobid(jobid)
+            if pod is None:
+                self.logger.warning(
+                    "[WARNING] Pod not found for job: {jobid}\n"
+                    "[WARNING] Ignore this error\n".format(jobid=jobid)
+                )
+                return
             self.kubeapi.delete_namespaced_pod(pod.metadata.name, self.namespace, body=body)
         except kubernetes.client.rest.ApiException as e:
             if e.status == 404 and ignore_not_found:
